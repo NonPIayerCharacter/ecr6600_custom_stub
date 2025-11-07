@@ -1,0 +1,16 @@
+out/**
+**/*.o
+**/*.oo
+**/*.obj
+*.idb
+*.exe
+*.pdb
+*.ncb
+*.bak
+*.tlog
+**/*.d
+/.vs
+.vscode
+*.su
+/.idea/**
+*.so
