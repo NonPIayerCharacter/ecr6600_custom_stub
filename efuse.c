@@ -161,29 +161,29 @@ void efuse_write(unsigned int addr, unsigned int value, unsigned int mask)
 }
 
 
-//void  efuse_read_series(unsigned int addr,unsigned int * value, unsigned int length)
-//{
-//	unsigned int i= 100;
-//	int temp = 0;
-//	
-//	while(((inw(EFUSE_INIT_DONE)) & 0x1) == 0)
-//	{
-//		udelay(2);
-//		if(i-- == 0)
-//			break;
-//	}
-//			
-//	for(i = 0; i < length; i++)
-//	{
-//		if((addr + 4*i) >= 0x20 && (addr + 4*i) <= 0x30){
-//			temp = inw(EFUSE_INFO + addr + 4*i);
-//		}else{
-//			temp = inw(EFUSE_READ + addr + 4*i);
-//		}
-//		memcpy(&value[i], &temp, 4);
-//	}
-//	
-//}
+void  efuse_read_series(unsigned int addr,unsigned int * value, unsigned int length)
+{
+	unsigned int i= 100;
+	int temp = 0;
+	
+	while(((inw(EFUSE_INIT_DONE)) & 0x1) == 0)
+	{
+		udelay(2);
+		if(i-- == 0)
+			break;
+	}
+			
+	for(i = 0; i < length; i++)
+	{
+		if((addr + 4*i) >= 0x20 && (addr + 4*i) <= 0x30){
+			temp = inw(EFUSE_INFO + addr + 4*i);
+		}else{
+			temp = inw(EFUSE_READ + addr + 4*i);
+		}
+		memcpy(&value[i], &temp, 4);
+	}
+	
+}
 
 void efuse_write_series(unsigned int addr, unsigned int *value, unsigned int mask, unsigned int length)
 {

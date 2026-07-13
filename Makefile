@@ -16,7 +16,7 @@ NM = $(CROSSDEV)nm
 SRC_PATH = $(shell pwd)
 LD_PATH  = $(shell pwd)
 
-VPATH	:=  $(SRC_PATH)
+VPATH	=  $(SRC_PATH)
 INCLUDE	:= -I$(SRC_PATH)/include -I$(SRC_PATH)/lib/bootrom
 CSRCS	:= 
 ASRCS	:=
@@ -35,9 +35,14 @@ endif
 
 
 #stub
-CSRCS += main.c uboot_cmd.c
-CSRCS += uboot_init.c hal_spiflash.c uboot_version.c efuse.c trng.c
+CSRCS += efuse.c main.c uboot_cmd.c
+CSRCS += uboot_init.c hal_spiflash.c uboot_version.c trng.c
 CSRCS += env.c
+
+VPATH += ../OpenBK7231T_App/libraries/miniz
+CSRCS += miniz.c
+CSRCS += miniz_tdef.c
+CSRCS += miniz_tinfl.c
 
 #ASRCS
 VPATH += bsp
@@ -64,7 +69,7 @@ LDSCRIPT = stub.ld
 
 #flag
 AFLAGS =
-CFLAGS = -g0 -Os -c -Wall -Wno-strict-aliasing -Wl,--mno-ex9
+CFLAGS = -g0 -Os -c -Wall -Wno-strict-aliasing -Wl,--mno-ex9 -std=gnu11
 LDFLAGS = -Os -nostartfiles -nostdlib -static -T $(LDSCRIPT)
 OBJCOPYFLAGS = -O binary -R .note -R .comment -S
 NMFLAGS = -B -n
@@ -82,6 +87,7 @@ ifdef DBGLOG_LEVEL
 CFLAGS += -DDBGLOG_LEVEL=$(DBGLOG_LEVEL)
 endif
 
+CFLAGS += -DTDEFL_LESS_MEMORY -DMINIZ_LITTLE_ENDIAN=1
 
 
 #STATIC_LINK_FLAGS += -Wl,--no-whole-archive -l:libc_rom.a -l:libgcc_rom.a -l:libm_rom.a
@@ -122,6 +128,7 @@ fullmask: $(OUT_PATH) $(OBJ_PATH) $(OBJS)
 	@./tools/trstool$(HOSTEXEEXT) elf2image out/$(BIN).elf --keyfile ./tools/key.pem --crc_enable True --image_type STUB --release_version no out/$(BIN).bin
 #	@python $(SRC_PATH)/tools/mkstub.py mkstub -i $(OUT_PATH)/$(BIN).bin -o $(OUT_PATH)/base64stub
 #	@$(SRC_PATH)/tools/bin2hex_new.pl  32 $(OUT_PATH)/$(BIN).bin $(OUT_PATH)/$(BIN)_32_bin
+	@gzip -k out/ECR6600F_customstub_V1.0.0.bin && mv out/ECR6600F_customstub_V1.0.0.bin.gz out/ECR6600_Stub_Custom.bin
 
 $(OUT_PATH):
 	@echo "mkdir -p $@"

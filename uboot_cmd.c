@@ -28,6 +28,7 @@
 #include "drv_spiflash.h"
 #include "dbglog.h"
 #include "env.h"
+#include "../OpenBK7231T_App/libraries/miniz/miniz.h"
 
 /*--------------------------------------------------------------------------
 * 	                                           Local Macros
@@ -46,6 +47,7 @@
 #define CAN 0x18
 #define CRC_MODE 'C'
 #define XMODEM_BLOCK_SIZE_1K 1024
+#define XMODEM_BLOCK_SIZE_128 128
 
 /*--------------------------------------------------------------------------
 * 	                                           Local Types
@@ -745,7 +747,7 @@ void uboot_flash_xmodem_dl(void* buf)
 	}
 }
 
-void uboot_flash_xmodem_ul(void* buf)
+void uboot_flash_xmodem_ul(bool isRaw, void* buf)
 {
 	uint8_t block_num = 1;
 	uint8_t data[XMODEM_BLOCK_SIZE_1K];
@@ -777,7 +779,14 @@ void uboot_flash_xmodem_ul(void* buf)
 		uint32_t chunk = (data_len > XMODEM_BLOCK_SIZE_1K) ? XMODEM_BLOCK_SIZE_1K : data_len;
 		memset(data, 0xFF, XMODEM_BLOCK_SIZE_1K); // pad with 0xFF
 
-		spiFlash_api_read(cfg_msg.addr + offset, data, chunk);
+		if(isRaw)
+		{
+			memcpy(data, (void*)cfg_msg.addr + offset, chunk);
+		}
+		else
+		{
+			spiFlash_api_read(cfg_msg.addr + offset, data, chunk);
+		}
 
 		uint16_t crc = crc16_ccitt(data, XMODEM_BLOCK_SIZE_1K);
 
@@ -824,6 +833,249 @@ void uboot_flash_xmodem_ul(void* buf)
 	return;
 }
 
+int mz_deflateInit3(mz_streamp pStream, int level, int method, int window_bits, int mem_level, int strategy)
+{
+	tdefl_compressor* pComp;
+	mz_uint comp_flags = tdefl_create_comp_flags_from_zip_params(level, window_bits, strategy);
+
+	if(!pStream)
+		return MZ_STREAM_ERROR;
+	if((method != MZ_DEFLATED) || ((mem_level < 1) || (mem_level > 9)) || ((window_bits != MZ_DEFAULT_WINDOW_BITS) && (-window_bits != MZ_DEFAULT_WINDOW_BITS)))
+		return MZ_PARAM_ERROR;
+
+	pStream->data_type = 0;
+	pStream->adler = 0;
+	pStream->msg = NULL;
+	pStream->reserved = 0;
+	pStream->total_in = 0;
+	pStream->total_out = 0;
+	if(!pStream->zalloc)
+		pStream->zalloc = miniz_def_alloc_func;
+	if(!pStream->zfree)
+		pStream->zfree = miniz_def_free_func;
+
+	pComp = (tdefl_compressor*)pStream->zalloc(pStream->opaque, 1, sizeof(tdefl_compressor));
+	if(!pComp)
+		return MZ_MEM_ERROR;
+
+	pStream->state = (struct mz_internal_state*)pComp;
+
+	if(tdefl_init(pComp, NULL, NULL, comp_flags) != TDEFL_STATUS_OKAY)
+	{
+		mz_deflateEnd(pStream);
+		return MZ_PARAM_ERROR;
+	}
+
+	return MZ_OK;
+}
+
+void uboot_flash_xmodem_ul_z(void* buf)
+{
+	uint8_t block_num = 1;
+	uint8_t resp = 0;
+	int retry;
+	int ret;
+	bool use_1k = true;
+	bool use_crc = true;
+
+	uint8_t packet[3 + XMODEM_BLOCK_SIZE_1K + 2];
+
+	struct load_cfg_msg cfg_msg;
+	struct message_rec_head* msg = (struct message_rec_head*)buf;
+
+	ACK_msg.status = STATUS_SUCCESS;
+	ACK_msg.magic = ACK_MAGIC;
+	ACK_msg.type = msg->type;
+	ACK_msg.data_len = 0x0000;
+	ACK_msg.CRC8 = uboot_mesage_check((unsigned char*)&ACK_msg, ACK_SIZE - 1);
+
+	uint8_t comp_level = cmd_data_buf[HEAD_SIZE + CFG_SIZE];
+	if(comp_level < 1 || comp_level > 10) comp_level = 5;
+
+	memcpy(&cfg_msg, &(cmd_data_buf[HEAD_SIZE]), CFG_SIZE);
+
+	uart_write((unsigned char*)&ACK_msg, ACK_SIZE);
+
+	int timeout = 10000;
+
+	while(timeout > 0)
+	{
+		if(uart_getc(SOC_UART0_BASE, &resp, 1000) == 0)
+		{
+			if(resp == CRC_MODE)
+			{
+				use_crc = true;
+				use_1k = true;
+				break;
+			}
+
+			if(resp == NAK)
+			{
+				use_crc = false;
+				use_1k = false;
+				break;
+			}
+
+			if(resp == CAN) return;
+		}
+
+		timeout -= 1000;
+	}
+
+	if(timeout <= 0)
+	{
+		uart_put_char(SOC_UART0_BASE, CAN);
+		uart_put_char(SOC_UART0_BASE, CAN);
+		return;
+	}
+
+	z_stream stream;
+
+	memset(&stream, 0, sizeof(stream));
+
+	const uint8_t* src = (const uint8_t*)(SOC_XIP_BASE + cfg_msg.addr);
+
+	uint32_t remaining = cfg_msg.len;
+
+	if(mz_deflateInit3(&stream, comp_level, MZ_DEFLATED, -MZ_DEFAULT_WINDOW_BITS, 9, MZ_DEFAULT_STRATEGY) != Z_OK)
+	{
+		return;
+	}
+
+	bool finished = false;
+
+	while(!finished)
+	{
+		uint32_t block_size;
+		uint8_t header;
+
+		if(use_1k)
+		{
+			block_size = XMODEM_BLOCK_SIZE_1K;
+			header = STX;
+		}
+		else
+		{
+			block_size = 128;
+			header = SOH;
+		}
+
+		memset(packet, 0xFF, sizeof(packet));
+
+		packet[0] = header;
+		packet[1] = block_num;
+		packet[2] = ~block_num;
+
+		stream.next_out = &packet[3];
+		stream.avail_out = block_size;
+
+		while(stream.avail_out)
+		{
+			if(stream.avail_in == 0 && remaining)
+			{
+				uint32_t n = remaining;
+
+				if(n > block_size) n = block_size;
+
+				stream.next_in = (unsigned char*)(src + (cfg_msg.len - remaining));
+
+				stream.avail_in = n;
+
+				remaining -= n;
+			}
+
+			ret = deflate(&stream, remaining ? Z_NO_FLUSH : Z_FINISH);
+
+			if(ret == Z_STREAM_END)
+			{
+				finished = true;
+				break;
+			}
+
+			if(ret != Z_OK)
+			{
+				deflateEnd(&stream);
+				return;
+			}
+		}
+
+		uint32_t pkt_len = 3 + block_size;
+
+		if(use_crc)
+		{
+			uint16_t crc = crc16_ccitt(&packet[3], block_size);
+
+			packet[pkt_len++] = crc >> 8;
+			packet[pkt_len++] = crc & 0xff;
+		}
+		else
+		{
+			uint8_t sum = 0;
+
+			for(uint32_t i = 0; i < block_size; i++)
+			{
+				sum += packet[3 + i];
+			}
+
+			packet[pkt_len++] = sum;
+		}
+
+		retry = 0;
+
+		while(retry < 10)
+		{
+			uart_write(packet, pkt_len);
+
+			ret = uart_getc(SOC_UART0_BASE, &resp, 5000);
+
+			if(ret == 0 && resp == ACK)
+			{
+				break;
+			}
+
+			retry++;
+		}
+
+		//if(use_1k && retry >= 7)
+		//{
+		//	use_1k = false;
+		//}
+
+		if(retry >= 10)
+		{
+			deflateEnd(&stream);
+
+			uart_put_char(SOC_UART0_BASE, CAN);
+			uart_put_char(SOC_UART0_BASE, CAN);
+
+			return;
+		}
+
+		block_num++;
+	}
+
+	deflateEnd(&stream);
+
+	retry = 0;
+
+	while(retry < 10)
+	{
+		uart_put_char(SOC_UART0_BASE, EOT);
+
+		ret = uart_getc(SOC_UART0_BASE, &resp, 5000);
+
+		if(ret == 0 && resp == ACK)
+		{
+			return;
+		}
+
+		retry++;
+	}
+
+	uart_put_char(SOC_UART0_BASE, CAN);
+	uart_put_char(SOC_UART0_BASE, CAN);
+}
+
 void uboot_flash_sha256(void* buf)
 {
 	struct load_cfg_msg cfg_msg;
@@ -851,6 +1103,212 @@ void uboot_flash_sha256(void* buf)
 	cmd_data_buf[HEAD_SIZE + 32] = STATUS_SUCCESS;
 	cmd_data_buf[HEAD_SIZE + 32 + 1] = uboot_mesage_check((unsigned char*)cmd_data_buf, HEAD_SIZE + 32 + 1);
 	uart_write((unsigned char*)cmd_data_buf, HEAD_SIZE + 32 + 2);
+}
+
+static uint32_t flash_buf_used = 0;
+static int flash_write_aligned(uint32_t* flash_offset,
+	uint8_t* src,
+	uint32_t len,
+	uint32_t flash_end)
+{
+	uint8_t* flash_buf = cmd_data_buf + (32 * 1024);
+	memcpy(flash_buf + flash_buf_used, src, len);
+	flash_buf_used += len;
+
+	uint32_t write_len = flash_buf_used & ~(3);
+
+	if(write_len)
+	{
+		if((*flash_offset + write_len) > flash_end)
+			return -1;
+
+		spiFlash_api_write(*flash_offset, flash_buf, write_len);
+
+		*flash_offset += write_len;
+
+		flash_buf_used -= write_len;
+		memmove(flash_buf, flash_buf + write_len, flash_buf_used);
+	}
+
+	return 0;
+}
+
+void uboot_flash_xmodem_dl_z(void* buf)
+{
+	uint8_t header[3] = { 0x00 };
+	uint8_t data[XMODEM_BLOCK_SIZE_1K] = { 0xFF };
+	uint8_t crc_bytes[2] = { 0x00 };
+	uint16_t crc_calc, crc_recv;
+	uint32_t flash_offset = 0;
+	const uint32_t cmdbufsize = 32 * 1024;
+	struct load_cfg_msg cfg_msg;
+	struct message_rec_head* msg = (struct message_rec_head*)buf;
+
+	ACK_msg.status = STATUS_SUCCESS;
+	ACK_msg.magic = ACK_MAGIC;
+	ACK_msg.type = msg->type;
+	ACK_msg.data_len = 0x0000;
+	ACK_msg.CRC8 = uboot_mesage_check((unsigned char*)&ACK_msg, ACK_SIZE - 1);
+
+	memcpy(&cfg_msg, &(cmd_data_buf[HEAD_SIZE]), CFG_SIZE);
+
+	if((cfg_msg.addr + cfg_msg.len) > g_flash_size)
+	{
+		ACK_msg.status = STATUS_ADDR_ERROR;
+		ACK_msg.CRC8 = uboot_mesage_check((unsigned char*)&ACK_msg, ACK_SIZE - 1);
+		uart_write((unsigned char*)&ACK_msg, ACK_SIZE);
+		return;
+	}
+
+	uart_write((unsigned char*)&ACK_msg, ACK_SIZE);
+	boot_usdelay(100000);
+	spiFlash_api_erase(cfg_msg.addr, cfg_msg.len);
+
+	mz_stream stream;
+	memset(&stream, 0, sizeof(stream));
+	if(mz_inflateInit2(&stream, -MZ_DEFAULT_WINDOW_BITS) != MZ_OK)
+	{
+		ACK_msg.status = STATUS_ERROR;
+		uart_write((unsigned char*)&ACK_msg, ACK_SIZE);
+		return;
+	}
+
+	uart_put_char(SOC_UART0_BASE, CRC_MODE);
+
+	flash_offset = cfg_msg.addr;
+
+	for(;;)
+	{
+		uint32_t data_size = 0;
+
+		if(uart_getc(SOC_UART0_BASE, &header[0], 3333) != 0)
+		{
+			uart_put_char(SOC_UART0_BASE, CRC_MODE);
+			continue;
+		}
+
+		if(header[0] == EOT)
+		{
+			stream.next_in = NULL;
+			stream.avail_in = 0;
+
+			while(1)
+			{
+				stream.next_out = cmd_data_buf;
+				stream.avail_out = cmdbufsize;
+
+				int status = mz_inflate(&stream, MZ_NO_FLUSH);
+				uint32_t produced = cmdbufsize - stream.avail_out;
+
+				if(produced > 0)
+				{
+					if(flash_write_aligned(&flash_offset,
+						cmd_data_buf,
+						produced,
+						cfg_msg.addr + cfg_msg.len) != 0)
+					{
+						goto abort_decompression;
+					}
+				}
+
+				if(status == MZ_STREAM_END) break;
+
+				if(status != MZ_OK && status != MZ_BUF_ERROR)
+					goto abort_decompression;
+			}
+
+			mz_inflateEnd(&stream);
+
+			uart_put_char(SOC_UART0_BASE, ACK);
+			return;
+		}
+
+		if(header[0] != STX && header[0] != SOH)
+		{
+			uart_put_char(SOC_UART0_BASE, NAK);
+			continue;
+		}
+
+		data_size = (header[0] == STX) ? XMODEM_BLOCK_SIZE_1K : XMODEM_BLOCK_SIZE_128;
+
+		uart_getc(SOC_UART0_BASE, &header[1], 10000);
+		uart_getc(SOC_UART0_BASE, &header[2], 10000);
+
+		if((header[1] + header[2]) != 0xFF)
+		{
+			uart_put_char(SOC_UART0_BASE, NAK);
+			continue;
+		}
+
+		for(int i = 0; i < data_size; i++)
+			uart_getc(SOC_UART0_BASE, &data[i], 20000);
+
+		uart_getc(SOC_UART0_BASE, &crc_bytes[0], 10000);
+		uart_getc(SOC_UART0_BASE, &crc_bytes[1], 10000);
+
+		crc_recv = ((uint16_t)crc_bytes[0] << 8) | crc_bytes[1];
+		crc_calc = crc16_ccitt(data, data_size);
+
+		if(crc_recv != crc_calc)
+		{
+			uart_put_char(SOC_UART0_BASE, NAK);
+			continue;
+		}
+
+		stream.next_in = data;
+		stream.avail_in = data_size;
+
+		while(stream.avail_in > 0)
+		{
+			stream.next_out = cmd_data_buf;
+			stream.avail_out = cmdbufsize;
+
+			int status = mz_inflate(&stream, MZ_NO_FLUSH);
+			uint32_t produced = cmdbufsize - stream.avail_out;
+
+			if(produced > 0)
+			{
+				if(flash_write_aligned(&flash_offset,
+					cmd_data_buf,
+					produced,
+					cfg_msg.addr + cfg_msg.len) != 0)
+				{
+					goto abort_decompression;
+				}
+			}
+
+			if(status == MZ_STREAM_END) break;
+
+			if(status != MZ_OK && status != MZ_BUF_ERROR)
+				goto abort_decompression;
+		}
+
+		uart_put_char(SOC_UART0_BASE, ACK);
+	}
+
+abort_decompression:
+	mz_inflateEnd(&stream);
+
+	uart_put_char(SOC_UART0_BASE, CAN);
+	uart_put_char(SOC_UART0_BASE, CAN);
+	uart_put_char(SOC_UART0_BASE, 'N');
+}
+
+#include "soc_top_reg.h"
+#include "clk.h"
+void uboot_read_efuse()
+{
+	ACK_msg.magic = ACK_MAGIC;
+	ACK_msg.type = 0x99;
+	ACK_msg.data_len = 0x80;
+	CLK_ENABLE(SOC_PD_CLK_EN_BASE0, EFUSE_CLK_BIT | EFUSE_APB_CLK_BIT);
+	memcpy(cmd_data_buf, &ACK_msg, HEAD_SIZE);
+	efuse_read_series(0, cmd_data_buf + HEAD_SIZE, 0x80);
+	//CLK_DISABLE(SOC_PD_CLK_EN_BASE0, EFUSE_CLK_BIT | EFUSE_APB_CLK_BIT);
+
+	cmd_data_buf[HEAD_SIZE + ACK_msg.data_len] = STATUS_SUCCESS;
+	cmd_data_buf[HEAD_SIZE + ACK_msg.data_len + 1] = uboot_mesage_check((unsigned char*)cmd_data_buf, HEAD_SIZE + ACK_msg.data_len + 1);
+	uart_write((unsigned char*)cmd_data_buf, HEAD_SIZE + ACK_msg.data_len + 2);
 }
 
 /* ********************************************************************************************************* */
@@ -1091,7 +1549,19 @@ int uart_cmd_parser(void)
 				uboot_flash_xmodem_dl(&cmd_data_buf);
 				break;
 			case 0x92:
-				uboot_flash_xmodem_ul(&cmd_data_buf);
+				uboot_flash_xmodem_ul(false, &cmd_data_buf);
+				break;
+			case 0x96:
+				uboot_flash_xmodem_ul_z(&cmd_data_buf);
+				break;
+			case 0x97:
+				uboot_flash_xmodem_dl_z(&cmd_data_buf);
+				break;
+			case 0x98:
+				uboot_flash_xmodem_ul(true, &cmd_data_buf);
+				break;
+			case 0x99:
+				uboot_read_efuse();
 				break;
 			
 			default:
@@ -1104,3 +1574,21 @@ int uart_cmd_parser(void)
 	}while(1);
 }
 
+__attribute__((__used__)) void* malloc(size_t size)
+{
+	// since it's the only allocation, just return raw address
+	return (void*)(0x00080000);
+}
+void* realloc(void* ptr, size_t size)
+{
+	return NULL;
+}
+void free(void* ptr)
+{
+
+}
+
+void __assert_func(const char* file, int line, const char* func, const char* failedexpr)
+{
+	while(1);
+}

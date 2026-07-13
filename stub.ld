@@ -4,7 +4,7 @@ Linker file used to link the bootloader.
 
 MEMORY
 {
-    boot_rom_ro (RWX) :     org = 0x00010000, len = 0x800000  /* the length of rom code (read only part)*/
+    boot_rom_ro (RWX) :     org = 0x00010000, len = 0x80000  /* the length of rom code (read only part)*/
 }
 
 /*  Default entry point:  */
